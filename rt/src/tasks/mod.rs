@@ -9,8 +9,6 @@
 
 mod tokio;
 
-use ::tokio::runtime::Handle;
-
 use crate::tracing::init_tracing;
 
 pub use crate::tasks::tokio::mpsc;
@@ -19,7 +17,9 @@ pub use crate::tasks::tokio::sleep;
 pub use crate::tasks::tokio::timeout;
 pub use crate::tasks::tokio::watch;
 pub use crate::tasks::tokio::CancellationToken;
-pub use crate::tasks::tokio::{spawn, spawn_blocking, task_id, JoinHandle, Runtime};
+pub use crate::tasks::tokio::{
+    block_in_place, spawn, spawn_blocking, task_id, Handle, JoinHandle, Runtime, RuntimeFlavor,
+};
 pub use crate::tasks::tokio::{BroadcastStream, ReceiverStream};
 use std::future::Future;
 
@@ -32,6 +32,7 @@ pub fn run<F: Future>(future: F) -> F::Output {
 }
 
 /// Block on a future using the current tokio runtime handle.
+/// Panics if no tokio runtime is active.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     Handle::current().block_on(future)
 }
