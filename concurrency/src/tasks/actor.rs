@@ -1,6 +1,7 @@
 use crate::child_handle::{ActorId, ChildHandle};
 use crate::error::{panic_message, ActorError, ExitReason};
 use crate::message::Message;
+use crate::monitor::{Down, MonitorRef};
 use core::pin::pin;
 use futures::future::{self, FutureExt as _};
 use spawned_rt::{
@@ -8,8 +9,22 @@ use spawned_rt::{
     threads,
 };
 use std::{
-    fmt::Debug, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration,
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
+
+/// Per-actor table of active monitors. Each entry maps a `MonitorRef` to a
+/// flag the watcher checks before delivering `Down`. Shared across `Context`
+/// clones via `Arc`.
+type MonitorTable = Arc<Mutex<HashMap<MonitorRef, Arc<AtomicBool>>>>;
 
 pub use crate::response::DEFAULT_REQUEST_TIMEOUT;
 
@@ -111,6 +126,7 @@ pub struct Context<A: Actor> {
     sender: mpsc::Sender<Box<dyn Envelope<A> + Send>>,
     cancellation_token: CancellationToken,
     completion_rx: watch::Receiver<Option<ExitReason>>,
+    monitors: MonitorTable,
 }
 
 impl<A: Actor> Clone for Context<A> {
@@ -120,6 +136,7 @@ impl<A: Actor> Clone for Context<A> {
             sender: self.sender.clone(),
             cancellation_token: self.cancellation_token.clone(),
             completion_rx: self.completion_rx.clone(),
+            monitors: self.monitors.clone(),
         }
     }
 }
@@ -139,6 +156,7 @@ impl<A: Actor> Context<A> {
             sender: actor_ref.sender.clone(),
             cancellation_token: actor_ref.cancellation_token.clone(),
             completion_rx: actor_ref.completion_rx.clone(),
+            monitors: actor_ref.monitors.clone(),
         }
     }
 
@@ -224,6 +242,72 @@ impl<A: Actor> Context<A> {
             sender: self.sender.clone(),
             cancellation_token: self.cancellation_token.clone(),
             completion_rx: self.completion_rx.clone(),
+            monitors: self.monitors.clone(),
+        }
+    }
+
+    /// Set up a unidirectional monitor on another actor.
+    ///
+    /// Returns a [`MonitorRef`] that can be used to cancel the monitor via
+    /// [`Context::demonitor`]. When the monitored actor stops, a [`Down`]
+    /// message is delivered to this actor's mailbox via `Handler<Down>`.
+    ///
+    /// If the target is already dead, a `Down` message is delivered immediately.
+    ///
+    /// Multiple independent monitors are allowed on the same target — each
+    /// call returns a distinct `MonitorRef`.
+    ///
+    /// Monitors are unidirectional: the monitored actor is unaware of the
+    /// monitor and unaffected by it.
+    pub fn monitor(&self, target: &ChildHandle) -> MonitorRef
+    where
+        A: Handler<Down>,
+    {
+        let monitor_ref = MonitorRef::next();
+        let active = Arc::new(AtomicBool::new(true));
+
+        self.monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(monitor_ref, active.clone());
+
+        let target = target.clone();
+        let actor_ref = self.actor_ref();
+        let monitors = self.monitors.clone();
+
+        rt::spawn(async move {
+            let reason = target.wait_exit_async().await;
+            // Remove the entry from the monitor table so it doesn't accumulate
+            // stale entries over the actor's lifetime. Done before delivery
+            // since `demonitor` is now a no-op for this monitor anyway.
+            monitors
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&monitor_ref);
+            if active.load(Ordering::Acquire) {
+                let _ = actor_ref.send(Down {
+                    monitor_ref,
+                    reason,
+                });
+            }
+        });
+
+        monitor_ref
+    }
+
+    /// Cancel a previously-set monitor.
+    ///
+    /// If the target hasn't yet died, no `Down` message will be delivered.
+    /// If a `Down` message has already been delivered (or queued), this is
+    /// a best-effort cancellation — the message may still arrive.
+    pub fn demonitor(&self, monitor_ref: MonitorRef) {
+        if let Some(active) = self
+            .monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&monitor_ref)
+        {
+            active.store(false, Ordering::Release);
         }
     }
 
@@ -293,6 +377,7 @@ pub struct ActorRef<A: Actor> {
     sender: mpsc::Sender<Box<dyn Envelope<A> + Send>>,
     cancellation_token: CancellationToken,
     completion_rx: watch::Receiver<Option<ExitReason>>,
+    monitors: MonitorTable,
 }
 
 impl<A: Actor> Debug for ActorRef<A> {
@@ -308,6 +393,7 @@ impl<A: Actor> Clone for ActorRef<A> {
             sender: self.sender.clone(),
             cancellation_token: self.cancellation_token.clone(),
             completion_rx: self.completion_rx.clone(),
+            monitors: self.monitors.clone(),
         }
     }
 }
@@ -449,12 +535,14 @@ impl<A: Actor> ActorRef<A> {
         let (tx, rx) = mpsc::channel::<Box<dyn Envelope<A> + Send>>();
         let cancellation_token = CancellationToken::new();
         let (completion_tx, completion_rx) = watch::channel(None);
+        let monitors: MonitorTable = Arc::new(Mutex::new(HashMap::new()));
 
         let actor_ref = ActorRef {
             id: ActorId::next(),
             sender: tx.clone(),
             cancellation_token: cancellation_token.clone(),
             completion_rx,
+            monitors: monitors.clone(),
         };
 
         let ctx = Context {
@@ -462,6 +550,7 @@ impl<A: Actor> ActorRef<A> {
             sender: tx,
             cancellation_token: cancellation_token.clone(),
             completion_rx: actor_ref.completion_rx.clone(),
+            monitors,
         };
 
         let inner_future = async move {
@@ -1236,6 +1325,279 @@ mod tests {
             actor.request(StopCounter).await.unwrap();
             actor.join().await;
             assert!(actor.exit_reason().is_some());
+        });
+    }
+
+    // --- Monitor tests ---
+
+    struct GetDowns;
+    impl Message for GetDowns {
+        type Result = Vec<crate::monitor::Down>;
+    }
+
+    /// Actor that exposes `monitor`/`demonitor` via messages, so tests can
+    /// drive it from outside. Records all received Down messages.
+    struct Watcher {
+        downs: Arc<Mutex<Vec<crate::monitor::Down>>>,
+    }
+
+    struct StartMonitor(crate::ChildHandle);
+    impl Message for StartMonitor {
+        type Result = crate::monitor::MonitorRef;
+    }
+    struct CallDemonitor(crate::monitor::MonitorRef);
+    impl Message for CallDemonitor {
+        type Result = ();
+    }
+
+    impl Actor for Watcher {}
+
+    impl Handler<StartMonitor> for Watcher {
+        async fn handle(
+            &mut self,
+            msg: StartMonitor,
+            ctx: &Context<Self>,
+        ) -> crate::monitor::MonitorRef {
+            ctx.monitor(&msg.0)
+        }
+    }
+
+    impl Handler<CallDemonitor> for Watcher {
+        async fn handle(&mut self, msg: CallDemonitor, ctx: &Context<Self>) {
+            ctx.demonitor(msg.0);
+        }
+    }
+
+    impl Handler<crate::monitor::Down> for Watcher {
+        async fn handle(&mut self, msg: crate::monitor::Down, _ctx: &Context<Self>) {
+            self.downs.lock().unwrap().push(msg);
+        }
+    }
+
+    impl Handler<GetDowns> for Watcher {
+        async fn handle(
+            &mut self,
+            _msg: GetDowns,
+            _ctx: &Context<Self>,
+        ) -> Vec<crate::monitor::Down> {
+            self.downs.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    pub fn monitor_running_actor_delivers_down_on_exit() {
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let monitor_ref = watcher.request(StartMonitor(target_handle)).await.unwrap();
+
+            // Stop the target — Down should be delivered
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+
+            // Give the watcher task time to deliver the message
+            rt::sleep(Duration::from_millis(50)).await;
+
+            let downs = watcher.request(GetDowns).await.unwrap();
+            assert_eq!(downs.len(), 1);
+            assert_eq!(downs[0].monitor_ref, monitor_ref);
+            assert!(matches!(downs[0].reason, ExitReason::Normal));
+        });
+    }
+
+    #[test]
+    pub fn monitor_already_dead_actor_delivers_down_immediately() {
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let _ = watcher.request(StartMonitor(target_handle)).await.unwrap();
+
+            // Wait for the watcher task to deliver Down
+            rt::sleep(Duration::from_millis(50)).await;
+
+            let downs = watcher.request(GetDowns).await.unwrap();
+            assert_eq!(downs.len(), 1);
+        });
+    }
+
+    #[test]
+    pub fn demonitor_before_target_dies_suppresses_down() {
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let monitor_ref = watcher.request(StartMonitor(target_handle)).await.unwrap();
+            watcher.request(CallDemonitor(monitor_ref)).await.unwrap();
+
+            // Now stop the target
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+            rt::sleep(Duration::from_millis(50)).await;
+
+            let downs = watcher.request(GetDowns).await.unwrap();
+            assert!(downs.is_empty(), "expected no Down, got {:?}", downs.len());
+        });
+    }
+
+    #[test]
+    pub fn multiple_monitors_each_get_own_ref_and_down() {
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let r1 = watcher
+                .request(StartMonitor(target_handle.clone()))
+                .await
+                .unwrap();
+            let r2 = watcher.request(StartMonitor(target_handle)).await.unwrap();
+            assert_ne!(r1, r2);
+
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+            rt::sleep(Duration::from_millis(50)).await;
+
+            let downs = watcher.request(GetDowns).await.unwrap();
+            assert_eq!(downs.len(), 2);
+            let refs: Vec<_> = downs.iter().map(|d| d.monitor_ref).collect();
+            assert!(refs.contains(&r1));
+            assert!(refs.contains(&r2));
+        });
+    }
+
+    #[test]
+    pub fn monitor_table_is_cleaned_up_after_target_dies() {
+        // Watcher should remove its entry from the monitor table after the
+        // target dies, so the table doesn't accumulate stale entries.
+        struct Inspect;
+        impl Message for Inspect {
+            type Result = usize;
+        }
+        impl Handler<Inspect> for Watcher {
+            async fn handle(&mut self, _msg: Inspect, ctx: &Context<Self>) -> usize {
+                ctx.monitors.lock().unwrap().len()
+            }
+        }
+
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let _ = watcher
+                .request(StartMonitor(target.child_handle()))
+                .await
+                .unwrap();
+            assert_eq!(watcher.request(Inspect).await.unwrap(), 1);
+
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+            // Give the watcher time to process and clean up
+            rt::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(
+                watcher.request(Inspect).await.unwrap(),
+                0,
+                "monitor table should be empty after target died"
+            );
+        });
+    }
+
+    #[test]
+    pub fn monitor_observes_panic_reason() {
+        struct PanicMsg;
+        impl Message for PanicMsg {
+            type Result = ();
+        }
+        struct PanicMe;
+        impl Actor for PanicMe {}
+        impl Handler<PanicMsg> for PanicMe {
+            async fn handle(&mut self, _msg: PanicMsg, _ctx: &Context<Self>) {
+                panic!("intentional panic");
+            }
+        }
+
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = PanicMe.start();
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let _ = watcher.request(StartMonitor(target_handle)).await.unwrap();
+            let _ = target.send(PanicMsg);
+
+            // Wait for target to panic and watcher to deliver
+            rt::sleep(Duration::from_millis(100)).await;
+
+            let downs = watcher.request(GetDowns).await.unwrap();
+            assert_eq!(downs.len(), 1);
+            assert!(matches!(downs[0].reason, ExitReason::Panic(_)));
+        });
+    }
+
+    #[test]
+    pub fn monitoring_actor_stops_before_target_does_not_panic() {
+        // Regression: if the monitoring actor stops while the target is still
+        // alive, the watcher must not crash when the target eventually dies.
+        // The watcher's send() will fail silently (mailbox closed), and the
+        // watcher exits cleanly.
+        let runtime = rt::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let target = Counter { count: 0 }.start();
+            let target_handle = target.child_handle();
+
+            let watcher = Watcher {
+                downs: Arc::new(Mutex::new(Vec::new())),
+            }
+            .start();
+
+            let _ = watcher.request(StartMonitor(target_handle)).await.unwrap();
+
+            // Stop the monitoring actor first
+            let watcher_handle = watcher.child_handle();
+            watcher_handle.stop();
+            watcher_handle.wait_exit_async().await;
+
+            // Now stop the target — the watcher should clean up without panicking
+            target.request(StopCounter).await.unwrap();
+            target.join().await;
+            // Give the orphaned watcher task time to attempt delivery
+            rt::sleep(Duration::from_millis(50)).await;
+            // If we got here without panicking, the test passes.
         });
     }
 }

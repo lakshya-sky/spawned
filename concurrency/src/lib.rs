@@ -55,8 +55,10 @@
 //! - [`threads`] — blocking actor runtime (native OS threads)
 //! - [`registry`] — global name-based actor registry
 //! - [`response`] — `Response<T>` unified wrapper for request-response
-//! - [`error`] — `ActorError` type
+//! - [`error`] — `ActorError` and `ExitReason` types
 //! - [`message`] — `Message` trait for defining message types
+//! - [`child_handle`] — `ChildHandle` and `ActorId` for type-erased actor management
+//! - [`monitor`] — `MonitorRef` and `Down` for unidirectional death observation
 //!
 //! # Choosing `tasks` vs `threads`
 //!
@@ -74,6 +76,7 @@
 pub mod child_handle;
 pub mod error;
 pub mod message;
+pub mod monitor;
 pub mod registry;
 pub mod response;
 pub mod tasks;
@@ -81,5 +84,6 @@ pub mod threads;
 
 pub use child_handle::{ActorId, ChildHandle};
 pub use error::{ActorError, ExitReason};
+pub use monitor::{Down, MonitorRef};
 pub use response::Response;
 pub use spawned_macros::{actor, protocol};
