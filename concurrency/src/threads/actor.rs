@@ -136,6 +136,7 @@ impl<A: Actor> Context<A> {
     /// Signal the actor to stop. The current handler will finish, then
     /// `stopped()` is called and the actor exits.
     pub fn stop(&self) {
+        self.cancellation_token().cancel();
         let _ = self.sender.send(MailboxItem::Shutdown);
     }
 
@@ -492,7 +493,10 @@ impl<A: Actor> From<ActorRef<A>> for ChildHandle {
     fn from(actor_ref: ActorRef<A>) -> Self {
         ChildHandle::from_threads(
             actor_ref.id,
-            actor_ref.cancellation_token,
+            Arc::new(move || {
+                actor_ref.cancellation_token.cancel();
+                let _ = actor_ref.sender.send(MailboxItem::Shutdown);
+            }),
             actor_ref.completion,
         )
     }
