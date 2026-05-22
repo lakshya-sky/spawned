@@ -136,7 +136,7 @@ impl<A: Actor> Context<A> {
     /// Signal the actor to stop. The current handler will finish, then
     /// `stopped()` is called and the actor exits.
     pub fn stop(&self) {
-        self.cancellation_token().cancel();
+        self.cancellation_token.cancel();
         let _ = self.sender.send(MailboxItem::Shutdown);
     }
 
